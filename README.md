@@ -1,4 +1,4 @@
-# Data-pipeline-with-spark-kafka
+# Real-time data-pipeline-with-spark-kafka
 This project implements a robust, end-to-end real-time data pipeline for COVID-19 statistics. It showcases the integration and orchestration of modern big data technologies to ingest, process, enrich, and store streaming data for analytical insights.
 
 ## Overview
