@@ -1,0 +1,7 @@
+__pycache__/
+plugins/
+.idea/
+.vscode/
+.DS_Store
+logs/
+.dockerignore

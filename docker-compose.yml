@@ -1,0 +1,190 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: airflow
+      MYSQL_USER: airflow
+      MYSQL_PASSWORD: airflow
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10 
+
+  zookeeper:
+    image: bitnami/zookeeper:3.8
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ALLOW_ANONYMOUS_LOGIN: "yes"
+    volumes:
+      - zookeeper-data:/bitnami/zookeeper
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 1 localhost 2181"] 
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: bitnami/kafka:3.4.0 # Ensure this matches your desired Kafka version
+    container_name: kafka
+    ports:
+      # Port for internal Docker network (Spark) - typically 9092
+      # This is the port Spark will connect to from within the Docker network
+      - "9092:9092"
+      # Port for external host connections (Python producer) - typically 29092
+      # This is the port your Python producer on your Mac will connect to
+      - "29092:29092"
+    environment:
+      KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Define all listeners. Each listener must have a unique name AND port.
+      # INTERNAL: for connections within the Docker network (e.g., Spark)
+      # EXTERNAL: for connections from the host machine (e.g., Python producer)
+      KAFKA_CFG_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092
+      # Advertise how clients should connect to these listeners.
+      # The listener names here (INTERNAL, EXTERNAL) must match those in KAFKA_CFG_LISTENERS.
+      KAFKA_CFG_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      # Map security protocols to each listener name
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      ALLOW_PLAINTEXT_LISTENER: "yes" # Allows plain text listeners for development
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: INTERNAL # Specify which listener is used for inter-broker communication
+      KAFKA_ENABLE_KRAFT: "no" # Explicitly disable KRaft to use ZooKeeper mode
+      KAFKA_CFG_BROKER_ID: 1 # Unique ID for this Kafka broker
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true" # Allows Kafka to create topics automatically
+    depends_on:
+      zookeeper:
+        condition: service_healthy # Ensures Zookeeper is ready before Kafka starts
+    volumes:
+      - kafka-data:/bitnami/kafka/data # Persistent storage for Kafka data
+    healthcheck:
+      # Healthcheck uses the INTERNAL listener's port (which is 9092 internally)
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    
+  spark-master: 
+    build: #
+      context: .
+      dockerfile: Dockerfile.spark_vanilla
+    container_name: spark-master
+    environment:
+      HADOOP_USER_NAME: root 
+      SPARK_MODE: master      
+      SPARK_MASTER_PORT: 7077
+      SPARK_MASTER_WEBUI_PORT: 8080      
+      SPARK_HOME: /opt/spark
+    ports:
+      - "8081:8080"
+      - "7077:7077"
+    volumes:
+      - ./spark_jars:/opt/bitnami/spark/jars
+      - ./scripts:/opt/spark/scripts
+      - ./krb5.conf:/etc/krb5.conf
+      - ./airflow_home/scripts:/opt/spark/app
+    networks:
+      - default
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+ 
+  spark-worker:
+    build: #
+      context: .
+      dockerfile: Dockerfile.spark_vanilla
+    container_name: spark-worker
+    environment:
+      HADOOP_USER_NAME: root
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 4G    
+      SPARK_HOME: /opt/spark 
+    volumes: 
+      - ./spark_jars:/opt/bitnami/spark/jars
+      - ./scripts:/opt/spark/scripts
+      - ./krb5.conf:/etc/krb5.conf
+      - ./airflow_home/scripts:/opt/spark/app
+    depends_on:
+      spark-master:
+        condition: service_started
+    networks:
+      - default    
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+
+  airflow_webserver:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: airflow_webserver
+    restart: always
+    environment:
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags            
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: mysql://airflow:airflow@mysql/airflow
+      AIRFLOW__WEBSERVER__PORT: 8080
+      AIRFLOW__WEBSERVER__RBAC: "True"
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.session
+      AIRFLOW_UID: 50000
+      AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark-master", "port": 7077, "extra": "{\"master\": \"spark://spark-master:7077\", \"deploy_mode\": \"client\"}"}'
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./airflow_home/dags:/opt/airflow/dags            
+      - ./airflow_home/logs:/opt/airflow/logs                  
+      - ./airflow_home/data:/opt/airflow/data      
+      - ./airflow_home/scripts:/opt/spark/app   
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      mysql:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    command: ["airflow", "webserver"]
+    healthcheck:
+      test: ["CMD-SHELL", 'curl --fail http://localhost:8080/health || exit 1']
+      interval: 10s
+      timeout: 10s
+      retries: 10 # Increase retries for more attempts
+      start_period: 60s # <--- IMPORTANT: Give it more time to start (e.g., 60 seconds)
+
+
+  airflow_scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: airflow_scheduler
+    restart: always
+    environment:
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags      
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: mysql://airflow:airflow@mysql/airflow
+      AIRFLOW_UID: 50000
+      AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark-master", "port": 7077, "extra": "{\"master\": \"spark://spark-master:7077\", \"deploy_mode\": \"client\"}"}'
+    ports:
+      - "4040:4040"
+    volumes:
+      - ./airflow_home/dags:/opt/airflow/dags            
+      - ./airflow_home/logs:/opt/airflow/logs            
+      - ./airflow_home/scripts:/opt/spark/app   
+      - ./airflow_home/data:/opt/airflow/data         
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      mysql:
+        condition: service_healthy
+      airflow_webserver:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    command: ["airflow", "scheduler"] 
+
+volumes:
+  mysql-data:
+  zookeeper-data:
+  kafka-data:

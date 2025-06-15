@@ -1,0 +1,100 @@
+# Dockerfile.airflow
+
+# spark_installer - Builds the Spark part
+FROM bitnami/spark:3.5.6 AS spark_installer
+
+# airflow_webserver - Builds the Airflow image
+FROM python:3.9-bookworm
+
+# Set environment variables for Airflow
+ARG AIRFLOW_VERSION=2.10.1
+# Define as ARG so it can be passed at build time
+ENV AIRFLOW_HOME=/opt/airflow
+ENV AIRFLOW_UID=50000
+ENV AIRFLOW_GID=0
+ENV PYTHONUNBUFFERED=1
+ENV PATH="${PATH}:${AIRFLOW_HOME}/.local/bin"
+
+# Set CONSTRAINTS_URL
+ENV CONSTRAINTS_URL="https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-3.9.txt"
+ENV CONSTRAINTS_FILE="/tmp/constraints.txt"
+
+USER root
+
+# Install system dependencies (including Java for Spark)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl \
+        gnupg2 \
+        software-properties-common \
+        default-libmysqlclient-dev \
+        build-essential \
+        libffi-dev \
+        libssl-dev \
+        git \
+        pkg-config \
+        openjdk-17-jre-headless \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set JAVA_HOME environment variable for OpenJDK 17 (ARM64 version)
+ENV JAVA_HOME /usr/lib/jvm/java-17-openjdk-arm64
+ENV PATH $PATH:$JAVA_HOME/bin
+
+# Remove any conflicting Spark installations explicitly (Good practice)
+RUN rm -rf /opt/spark /usr/local/spark /opt/bitnami/spark
+
+# Copy the entire Spark installation from the spark_installer stage
+COPY --from=spark_installer /opt/bitnami/spark /opt/bitnami/spark
+
+ENV SPARK_HOME=/opt/bitnami/spark
+
+ENV PATH="${SPARK_HOME}/bin:${SPARK_HOME}/sbin:${PATH}"
+
+# Create the Spark scripts directory
+RUN mkdir -p ${SPARK_HOME}/scripts
+
+# Set Python environment to be specific for Airflow
+ENV PYTHONPATH=${AIRFLOW_HOME}
+
+# Create the airflow user and group
+RUN groupadd -r airflow --gid=${AIRFLOW_UID} && \
+    useradd -r -g airflow -d ${AIRFLOW_HOME} -s /bin/bash airflow
+
+# Create necessary directories and set ownership
+RUN mkdir -p ${AIRFLOW_HOME}/dags ${AIRFLOW_HOME}/logs ${AIRFLOW_HOME}/plugins && \
+    chown -R airflow:airflow ${AIRFLOW_HOME} ${SPARK_HOME}/scripts # Keep this for SPARK_HOME/scripts
+# Download Airflow constraints file
+RUN curl -sSL "${CONSTRAINTS_URL}" -o "${CONSTRAINTS_FILE}" || \
+    (echo "Error: Could not download constraints file. Check URL or network." && exit 1)
+
+# Change ownership of constraints file to airflow user while still root
+RUN chown airflow:airflow "${CONSTRAINTS_FILE}"
+
+# Copy your custom requirements.txt to the Airflow HOME
+COPY airflow_home/requirements.txt /opt/airflow/
+
+USER airflow
+WORKDIR ${AIRFLOW_HOME}
+# Set WORKDIR for the airflow user
+
+# Upgrade pip before installing requirements
+RUN python3 -m pip install --upgrade pip
+
+# Install Airflow and providers first using constraints
+RUN set -ex && python3 -m pip install --no-cache-dir \
+    "apache-airflow==${AIRFLOW_VERSION}" \
+    "apache-airflow-providers-apache-spark==4.10.0" \
+    "apache-airflow-providers-mysql==5.7.0" \
+    -c "${CONSTRAINTS_FILE}" && \
+    python3 -m pip install --no-cache-dir -r requirements.txt -c "${CONSTRAINTS_FILE}"
+
+# Cleanup the constraints file (as airflow user, since it now owns it)
+RUN rm "${CONSTRAINTS_FILE}"
+
+# Copy your DAGs folder into the Airflow DAGs path (already as airflow user)
+COPY airflow_home/dags /opt/airflow/dags
+
+EXPOSE 8080
+
+CMD ["airflow", "webserver"]
