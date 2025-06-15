@@ -1,73 +1,132 @@
-# data-pipeline-with-spark-kafka
-This repository provides a robust and scalable data pipeline designed to ingest, process, and analyze real-time COVID-19 related data streams. Built with Apache Kafka for data ingestion, Apache Spark for distributed processing, and Apache Airflow for workflow orchestration, the entire stack is containerized using Docker and Docker Compose for easy setup and deployment.
+# Data-pipeline-with-spark-kafka
+This project implements a robust, end-to-end real-time data pipeline for COVID-19 statistics. It showcases the integration and orchestration of modern big data technologies to ingest, process, enrich, and store streaming data for analytical insights.
 
 ## Overview
-* **Apache Kafka:** Serves as a high-throughput, fault-tolerant message broker for ingesting raw COVID-19 data.
-* **Apache Spark:** A streaming application that continuously consumes data from Kafka, performs transformations (e.g., windowed aggregations), and outputs the results.
-* **Apache Airflow:** Orchestrates the entire workflow, specifically responsible for submitting the Spark streaming job to the Spark cluster.
-* **Docker & Docker Compose:** Containerize all services (Kafka, Zookeeper, Spark Master, Spark Worker, Airflow Webserver, Airflow Scheduler, Airflow Worker) for consistent and isolated local development/testing environments.
+This pipeline efficiently ingests daily COVID-19 data from the OWID API via **Kafka**, performs real-time **1-minute windowed aggregations** and **joins with static demographic data** within **Spark Structured Streaming**, calculates derived metrics (e.g., new cases per million), and ensures reliable **persistence to MySQL**. The entire data flow is **orchestrated by Airflow** and deployed using **Docker Compose** for streamlined management and reproducibility.
+
+## **Architecture**
+```mermaid
+flowchart TD
+    OWID_API["OWID&nbsp;API<br/>CSV&nbsp;Data"] --> KAFKA["Kafka<br/>Topic:&nbsp;covid_data"]
+    KAFKA --> SPARK_CLUSTER["Spark&nbsp;Master&nbsp;&amp;&nbsp;Workers"]
+    SPARK_CLUSTER --> SPARK_STREAM["Spark&nbsp;Streaming<br/>(Aggregations&nbsp;&amp;<br/>Join&nbsp;with&nbsp;static&nbsp;'countries'&nbsp;data)"]
+    SPARK_STREAM --> MYSQL["MySQL<br/>(covid_aggregates)"]
+    AIRFLOW["Airflow<br/>(Orchestration)"] --> SPARK_CLUSTER
+```
+
+## ETL Pipeline
+**Extract (Kafka Producer):**
+A Python script periodically fetches live COVID-19 data from the OWID API and publishes the data as JSON messages to a Kafka topic (`covid_data`).
+
+**Transform (Spark Structured Streaming):**
+A PySpark streaming application consumes data from Kafka in near real-time, applies **time-windowed aggregations**, and **enriches** the stream by joining with a **static countries lookup table** cached from MySQL. Derived metrics, such as *new cases per million*, are calculated during this stage.
+
+**Load (MySQL Sink):**
+The transformed and enriched data is written into the `covid_aggregates` table in a **MySQL** database, serving as a central store for downstream analysis or reporting.
 
 ## Project Structure
 
 ```data-pipeline-with-spark-kafka/
-├── Dockerfile.airflow              # Airflow environment with Spark client.
-├── Dockerfile.spark_vanilla        # Builds Spark cluster images
+├── docker-compose.yml
+├── Dockerfile.airflow
+├── Dockerfile.spark_vanilla
 ├── airflow_home/
 │   ├── dags/
-│   │   └── spark_dag.py            # Airflow DAG: Orchestrates the Spark consumer job submission.
-│   └── scripts/
-│       ├── kafka_consumer_spark.py # PySpark application: Reads from Kafka, processes data.
-│       └── kafka_producer.py       # Python script: Produces sample COVID-19 data to Kafka.
-├── data/                           # Directory for source data files
-│   └── sample_covid.csv            # Sample CSV data used by kafka_producer.py
-├── docker-compose.yml              # Defines and links all Docker services (Kafka, Spark, Airflow components)
-├── .gitignore                      # Specifies intentionally untracked files and directories.
-└── README.md                       # This documentation file.
+│   │   └── spark_consumer_dag.py
+│   ├── scripts/
+│   │   ├── kafka_producer.py
+│   │   └── spark_consumer_kafka.py
+│   ├── requirements.txt
+├── .gitignore
+└── README.md                   
 ```
 ## Prerequisites
-**Docker Desktop:** This includes Docker Engine and Docker Compose, essential for spinning up all the services.
- * [Download Docker Desktop](https://www.docker.com/products/docker-desktop)
+Docker Desktop
+
+Git
 
 ## Getting Started
 ### Clone the Repository
-``` git clone https://github.com/arunbalasundar/data-pipeline-with-spark-kafka.git```
-```cd data-pipeline-with-spark-kafka```
-
-### Prepare Sample Data
-The kafka_producer.py script requires a sample_covid.csv file. You must place your sample_covid.csv file in a data folder at the root of your cloned repository.
-
-```mkdir -p data```
-Copy your sample_covid.csv into the new 'data' folder
-```cp /path/to/your/sample_covid.csv data/sample_covid.csv```
-(Ensure sample_covid.csv contains appropriate columns like 'date', 'location', 'new_cases', 'total_cases' as expected by kafka_producer.py.)
+```bash
+git clone https://github.com/arunbalasundar/data-pipeline-with-spark-kafka.git
+cd data-pipeline-with-spark-kafka
+```
 
 ### Build docker images and Start services
-Build the custom Docker images and launch all the defined services (Kafka, Zookeeper, Spark Master, Spark Worker, Airflow components) in detached mode.
+```bash
+docker-compose up --build --no-cache -d
+```
 
-```docker-compose build```
-```docker-compose up -d```
+### Airflow setup
+```bash
+docker exec -it airflow_webserver airflow db migrate
+docker exec -it airflow_webserver airflow users create --username airflow --firstname Airflow --lastname User --role Admin --email airflow@example.com --password airflow
+```
+
+### Setup MySQL tables
+```bash
+docker exec -it mysql bash
+mysql -u airflow -pairflow airflow
+```
+
+```sql
+DROP TABLE IF EXISTS covid_aggregates;
+CREATE TABLE covid_aggregates (
+    window_start DATETIME, window_end DATETIME, location VARCHAR(255),
+    total_new_cases_in_window INT, avg_new_cases_per_entry DECIMAL(20, 2),
+    max_new_cases_in_window INT, total_cases_sum_in_window BIGINT,
+    avg_total_cases_per_entry DECIMAL(20, 2), continent VARCHAR(255),
+    population BIGINT, new_cases_per_million_in_window DECIMAL(20, 4),
+    processing_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (window_start, location)
+  );
+DROP TABLE IF EXISTS countries;
+CREATE TABLE countries (
+    id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL UNIQUE,
+    population BIGINT, continent VARCHAR(255), iso_code VARCHAR(3)
+);
+INSERT INTO countries (name, population, continent, iso_code) VALUES
+('New Zealand', 5120000, 'Oceania', 'NZL'), ('United States', 331900000, 'North America', 'USA'),
+('India', 1400000000, 'Asia', 'IND'), ('Germany', 83200000, 'Europe', 'DEU'),
+('Brazil', 215000000, 'South America', 'BRA'), ('Australia', 26000000, 'Oceania', 'AUS'),
+('United Kingdom', 67000000, 'Europe', 'GBR'), ('Canada', 38000000, 'North America', 'CAN');
+```
+
+### Kafka Topic and Data Creation
+```bash
+docker exec -it kafka bash -c "kafka-topics.sh --create --topic covid_data --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
+```
 
 ## Access Airflow UI: 
 Open your web browser and navigate to http://localhost:8080.
 
-### Create Spark Connection:
-* Go to Admin > Connections.
-* Click the + button to create a new connection.
-* Conn Id: spark_default1 (This must exactly match the connection ID used in your spark_dag.py)
-* Conn Type: Spark
-* Master URI: spark://spark-master:7077 (This allows Airflow to connect to your Spark Master container within the Docker network)
+### Create Airflow Spark Connection:
+Create a Spark connection (Admin > Connections): Conn Id: spark_default, Conn Type: Spark, Master URI: spark://spark-master:7077.
 
-### kafka topic and data creation
-The pipeline relies on a Kafka topic named covid_data. Your kafka_producer.py script sends data to this topic.
+# Running the Pipeline
+## Run the producer script:
+```bash
+cd airflow_home/scripts/
+python3 kafka_producer.py
+```
 
-Find an Airflow Container ID: (e.g., airflow_worker or airflow_scheduler)
-```docker ps | grep airflow_worker # Or 'airflow_scheduler'```
-Exec into the container:
-```docker exec -it <airflow_container_id> bash```
-
-Run the producer script:
-```cd /opt/airflow/scripts/```
-```python3 kafka_producer.py kafka:9092```
-
-# Enable and Trigger Airflow DAG
+## Enable and Trigger Airflow DAG
 Run ```spark_kafka_consumer_pipeline``` DAG
+
+## Monitor and Verify
+```bash
+docker exec -it mysql bash
+mysql -u airflow -pairflow airflow
+```
+
+```sql
+SELECT window_start, location, continent, population, new_cases_per_million_in_window 
+FROM covid_aggregates 
+WHERE new_cases_per_million_in_window IS NOT NULL 
+AND new_cases_per_million_in_window > 0 
+LIMIT 20;
+```
+
+```sql
+SELECT COUNT(*) FROM covid_aggregates;
+```
